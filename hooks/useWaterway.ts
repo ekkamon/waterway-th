@@ -87,6 +87,16 @@ export function useStationGraph(stationId: number | null) {
   });
 }
 
+// For stations ThaiWater has no graph for: DWR sensors and the CCTV-read gauge.
+export function useStationSeries(id: string | null) {
+  return useQuery({
+    queryKey: ["station-series", id],
+    queryFn: () => getJson<GraphPoint[]>(`/api/waterway/central/series?id=${encodeURIComponent(id ?? "")}`),
+    enabled: id != null,
+    staleTime: 120_000,
+  });
+}
+
 export function useWaterwayTrend(enabled: boolean) {
   return useQuery({
     queryKey: waterwayQueryKeys.trend,

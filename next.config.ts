@@ -6,6 +6,11 @@ const nextConfig: NextConfig = {
   outputFileTracingExcludes: {
     "*": ["./data/**"],
   },
+  // The CCTV gauge reader spawns this bundled ffmpeg binary, which file tracing cannot see.
+  serverExternalPackages: ["ffmpeg-static"],
+  outputFileTracingIncludes: {
+    "*": ["./node_modules/ffmpeg-static/ffmpeg*"],
+  },
 };
 
 export default nextConfig;

@@ -1,4 +1,5 @@
 import { CENTRAL_BASINS, damRiverKey, riverKeyOf } from "./basin";
+import { readSuanThepGauge } from "./cctv-gauge";
 import type { CentralPayload, CentralStation, DamStation, Situation } from "./types";
 
 const HII_BASE = "https://api-v3.thaiwater.net/api/v1/thaiwater30/public";
@@ -102,6 +103,153 @@ function normalizeDam(r: Raw): DamStation | null {
   };
 }
 
+// ThaiWater has no gauge at the Suan Thep Pathum embankment (ต.บางปรอก อ.เมืองปทุมธานี), but the
+// municipality's CCTV watches a staff gauge there: we read the staff from the video and keep the
+// frame it was read from as a snapshot. Bank 2.57 m is DWR's bank at สะพานปทุมธานี 1, the nearest
+// real gauge (see fetchDwrStation).
+const SUANTHEP_ID = "cctv-suanthep";
+const SUANTHEP_BANK_M = 2.57;
+// The stream updates every minute, so a reading older than this means the camera or link is down.
+const CCTV_STALE_MS = 30 * 60 * 1000;
+
+function situationFor(level: number | null, stale: boolean, bank: number): Situation | null {
+  if (stale || level == null) return null;
+  return level >= bank ? 5 : level >= bank - 0.3 ? 4 : 3;
+}
+
+async function fetchSuanThep(previous: CentralStation | null): Promise<CentralStation> {
+  let reading: Awaited<ReturnType<typeof readSuanThepGauge>> | null = null;
+  try {
+    reading = await readSuanThepGauge();
+  } catch (error) {
+    console.error("[waterway-cron] cctv suanthep failed:", error instanceof Error ? error.message : error);
+  }
+
+  // On a failed read keep the last good value, flagged stale so it is not trusted or coloured.
+  const level = reading?.level ?? previous?.level ?? null;
+  const updatedAt = reading?.updatedAt ?? previous?.updatedAt ?? null;
+  const stale = updatedAt == null || Date.now() - new Date(updatedAt).getTime() > CCTV_STALE_MS;
+  const moved = previous != null && previous.updatedAt !== updatedAt;
+
+  return {
+    id: SUANTHEP_ID,
+    code: "CCTV-STP",
+    name: "เขื่อนสวนเทพปทุมเฉลิมพระเกียรติฯ (อ่านจากกล้อง CCTV)",
+    province: "ปทุมธานี",
+    district: "เมืองปทุมธานี",
+    basin: "ลุ่มน้ำเจ้าพระยา",
+    river: "แม่น้ำเจ้าพระยา",
+    riverKey: "chaophraya",
+    lat: 14.02283238,
+    lng: 100.53555608,
+    level,
+    previous: moved ? (previous?.level ?? null) : (previous?.previous ?? null),
+    bankMin: SUANTHEP_BANK_M,
+    groundLevel: null,
+    bankPercent: null,
+    discharge: null,
+    stale,
+    situation: situationFor(level, stale, SUANTHEP_BANK_M),
+    isKey: true, // shown from the overview zoom, not only once zoomed into the reach
+    updatedAt,
+    agency: "เทศบาลเมืองปทุมธานี (ค่าประมาณจากภาพกล้อง CCTV)",
+    graphStationId: null,
+    // Only offered once a frame has actually been saved by a successful read.
+    snapshotUrl: reading || previous?.snapshotUrl ? "/api/waterway/cctv/suanthep" : null,
+  };
+}
+
+// DWR (กรมทรัพยากรน้ำ) telemetry is not part of the ThaiWater feed, but has a public API.
+// สะพานปทุมธานี 1 (TA100219, ต.บางปรอก) is a real level sensor. สะพานปทุมธานี 2 (TC100224, ต.บ้านใหม่)
+// currently publishes no level (wlEnabled=false) and its camera shows no staff gauge, so it is
+// listed with its camera picture only; it picks up a level automatically if DWR ever enables one.
+export const DWR_API = "https://telemetry.dwr.go.th/api";
+const DWR_STALE_MS = 3 * 60 * 60 * 1000;
+
+const DWR_STATIONS = [
+  // UTM 47N 666240.7 E / 1551043.6 N -> WGS84
+  { code: "TA100219", lat: 14.0251, lng: 100.5394, name: "สะพานปทุมธานี 1", district: "เมืองปทุมธานี" },
+  // UTM 47N 665905.2 E / 1544480.7 N -> WGS84
+  { code: "TC100224", lat: 13.9658, lng: 100.5359, name: "สะพานปทุมธานี 2", district: "เมืองปทุมธานี" },
+] as const;
+export const DWR_CODES: readonly string[] = DWR_STATIONS.map((s) => s.code);
+
+// DWR keeps ~5 days of hourly levels per station (the chart on its own site). Oldest first.
+export async function fetchDwrSeries(code: string): Promise<[number, number][]> {
+  const res = await fetch(`${DWR_API}/public/station/getByCode/${code}`, {
+    headers: HEADERS,
+    cache: "no-store",
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!res.ok) throw new Error(`DWR ${code} -> HTTP ${res.status}`);
+  const past: Raw[] = ((await res.json()) as Raw).value?.wlChart?.past ?? [];
+  return past
+    .map((p) => [Date.parse(p.date), toNum(p.value)] as const)
+    .filter((p): p is readonly [number, number] => !Number.isNaN(p[0]) && p[1] != null)
+    .map(([t, v]) => [t, v] as [number, number])
+    .sort((a, b) => a[0] - b[0]);
+}
+
+async function fetchDwrStation(
+  cfg: (typeof DWR_STATIONS)[number],
+  previous: CentralStation | null,
+): Promise<CentralStation | null> {
+  const id = `dwr-${cfg.code}`;
+  try {
+    const res = await fetch(`${DWR_API}/public/station/getByCode/${cfg.code}`, {
+      headers: HEADERS,
+      cache: "no-store",
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const v = ((await res.json()) as Raw).value ?? {};
+    const cur = v.stationCurrentData ?? {};
+    const e = v.fullCon?.entity ?? {};
+    const level = toNum(cur.wl);
+    const t = typeof cur.wlTimeStamp === "string" ? Date.parse(cur.wlTimeStamp) : NaN;
+    const hasLevel = level != null && !Number.isNaN(t);
+    const updatedAt = hasLevel ? new Date(t).toISOString() : null;
+    const banks = [toNum(e.lbMsl), toNum(e.rbMsl)].filter((n): n is number => n != null);
+    // A station without surveyed banks (TC100224) falls back to DWR's critical level, which on
+    // TA100219 (2.54) sits within 3 cm of its lowest bank (2.57).
+    const bankMin = banks.length ? Math.min(...banks) : toNum(e.wlFc);
+    // No level telemetry is not a fault: show "no data" rather than the "station down" state.
+    const stale = hasLevel && Date.now() - t > DWR_STALE_MS;
+    const moved = previous != null && previous.updatedAt !== updatedAt;
+    return {
+      id,
+      code: cfg.code,
+      name: e.stnNameTh ?? cfg.name,
+      province: "ปทุมธานี",
+      district: cfg.district,
+      basin: "ลุ่มน้ำเจ้าพระยา",
+      river: "แม่น้ำเจ้าพระยา",
+      riverKey: "chaophraya",
+      lat: cfg.lat,
+      lng: cfg.lng,
+      level: hasLevel ? level : null,
+      previous: moved ? (previous?.level ?? null) : (previous?.previous ?? null),
+      bankMin,
+      groundLevel: toNum(e.bbMsl),
+      bankPercent: null,
+      discharge: null,
+      stale,
+      situation: hasLevel && bankMin != null ? situationFor(level, stale, bankMin) : null,
+      isKey: true,
+      updatedAt,
+      agency: hasLevel
+        ? "กรมทรัพยากรน้ำ (DWR Telemetry)"
+        : "กรมทรัพยากรน้ำ (DWR) · ไม่มีค่าระดับน้ำ มีเฉพาะภาพกล้อง",
+      graphStationId: null,
+      snapshotUrl: e.cctvEnabled ? `/api/waterway/cctv/dwr/${cfg.code}` : null,
+    };
+  } catch (error) {
+    console.error(`[waterway-cron] dwr ${cfg.code} failed:`, error instanceof Error ? error.message : error);
+    // Keep the last value but flag it stale; it recovers on the next successful poll.
+    return previous ? { ...previous, stale: previous.level != null, situation: null } : null;
+  }
+}
+
 async function getJson<T>(path: string): Promise<T> {
   const res = await fetch(`${HII_BASE}/${path}`, {
     headers: HEADERS,
@@ -125,7 +273,7 @@ export async function fetchCentral(previous: CentralPayload | null): Promise<Cen
     previous.dams.length > 0 &&
     Date.now() - new Date(previous.damsFetchedAt).getTime() < DAM_REFRESH_MS;
 
-  const [levels, dams] = await Promise.all([
+  const [levels, dams, suanThep, ...dwr] = await Promise.all([
     getJson<{ waterlevel_data?: { data?: Raw[] } }>("waterlevel_load"),
     damsFresh
       ? Promise.resolve(null)
@@ -133,6 +281,8 @@ export async function fetchCentral(previous: CentralPayload | null): Promise<Cen
           console.error("[waterway-cron] central dams failed:", error instanceof Error ? error.message : error);
           return null;
         }),
+    fetchSuanThep(previous?.stations.find((s) => s.id === SUANTHEP_ID) ?? null),
+    ...DWR_STATIONS.map((cfg) => fetchDwrStation(cfg, previous?.stations.find((s) => s.id === `dwr-${cfg.code}`) ?? null)),
   ]);
 
   return {
@@ -141,6 +291,7 @@ export async function fetchCentral(previous: CentralPayload | null): Promise<Cen
     dams: dams ?? previous?.dams ?? [],
     stations: (levels.waterlevel_data?.data ?? [])
       .map(normalizeStation)
-      .filter((v): v is CentralStation => v !== null),
+      .filter((v): v is CentralStation => v !== null)
+      .concat(suanThep, dwr.filter((v): v is CentralStation => v !== null)),
   };
 }

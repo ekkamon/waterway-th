@@ -3,15 +3,15 @@ import path from "node:path";
 
 import { fetchBma } from "./bma";
 import { fetchCentral } from "./central";
+import { SNAPSHOT_DIR } from "./paths";
 import { fetchThaiwater } from "./thaiwater";
 import type { BmaPayload, CentralPayload, ThaiwaterPayload } from "./types";
 
-// DATA_DIR keeps snapshots outside the build folder so a rebuild does not wipe history.
-const SNAPSHOT_DIR = process.env.DATA_DIR
-  ? path.resolve(process.env.DATA_DIR)
-  : path.join(process.cwd(), "data", "snapshots");
 const HISTORY_FILE = path.join(SNAPSHOT_DIR, "history.json");
 const HISTORY_WINDOW_MS = 24 * 60 * 60 * 1000;
+// CCTV-read gauges have no upstream history to fall back on, so we keep their record longer.
+const CCTV_HISTORY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const windowFor = (id: string) => (id.startsWith("cctv-") ? CCTV_HISTORY_WINDOW_MS : HISTORY_WINDOW_MS);
 
 type History = Record<string, [number, number][]>;
 
@@ -42,7 +42,7 @@ async function appendHistory(levels: { id: string; level: number | null }[]) {
     series.push([now, level]);
   }
   for (const id of Object.keys(history)) {
-    history[id] = history[id].filter(([t]) => now - t <= HISTORY_WINDOW_MS);
+    history[id] = history[id].filter(([t]) => now - t <= windowFor(id));
     if (history[id].length === 0) delete history[id];
   }
   await mkdir(SNAPSHOT_DIR, { recursive: true });
@@ -90,6 +90,9 @@ export function refreshSnapshots(): Promise<void> {
           const data = (await fetcher()) as SnapshotMap[SnapshotName];
           await writeSnapshot(name, data as never);
           if ("levels" in data) await appendHistory(data.levels);
+          // ThaiWater/DWR serve history for their own gauges; only the CCTV-read one needs ours.
+          else if ("stations" in data)
+            await appendHistory(data.stations.filter((s) => s.id.startsWith("cctv-") && !s.stale));
           console.log(`[waterway-cron] ${name} updated`);
         } catch (error) {
           console.error(`[waterway-cron] ${name} failed:`, error instanceof Error ? error.message : error);

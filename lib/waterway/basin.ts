@@ -134,7 +134,7 @@ export const SCHEMATIC: SchematicReach[] = [
     label: "ปทุมธานี · นนทบุรี · กรุงเทพฯ",
     note: "ระดับน้ำขึ้นลงตามน้ำทะเลหนุน",
     branches: [
-      { river: "chaophraya", label: "เจ้าพระยา", stations: ["CPY014", "C.12", "CPY015"] },
+      { river: "chaophraya", label: "เจ้าพระยา", stations: ["CCTV-STP", "TA100219", "TC100224", "CPY014", "C.12", "CPY015"] },
       { river: "thachin", label: "ท่าจีน (นครปฐม)", stations: ["T.1", "T.14"] },
     ],
   },

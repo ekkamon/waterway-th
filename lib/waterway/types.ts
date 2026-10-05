@@ -147,6 +147,8 @@ export type CentralStation = {
   updatedAt: string | null;
   agency: string;
   graphStationId: number | null;
+  /** Still frame the reading was taken from (CCTV-derived stations only). */
+  snapshotUrl?: string | null;
 };
 
 export type DamStation = {

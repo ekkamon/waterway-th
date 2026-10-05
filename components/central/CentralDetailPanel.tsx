@@ -13,7 +13,7 @@ import {
   YAxis,
 } from 'recharts';
 
-import { useStationGraph } from '@/hooks/useWaterway';
+import { useStationGraph, useStationSeries } from '@/hooks/useWaterway';
 import { RIVER_META } from '@/lib/waterway/basin';
 import {
   damColor,
@@ -95,7 +95,11 @@ function Shell({
 }
 
 function StationGraph({ station }: { readonly station: CentralStation }) {
-  const graph = useStationGraph(station.graphStationId);
+  // ThaiWater stations chart from ThaiWater; DWR / CCTV-read ones from our own series route.
+  const own = station.graphStationId == null && /^(dwr|cctv)-/.test(station.id);
+  const tw = useStationGraph(station.graphStationId);
+  const mine = useStationSeries(own ? station.id : null);
+  const graph = own ? mine : tw;
   const points = (graph.data ?? [])
     .filter((p) => p.value != null)
     .map((p) => ({ t: new Date(p.time).getTime(), v: p.value as number }));
@@ -212,6 +216,38 @@ function DamCctv({ url }: { readonly url: string }) {
   );
 }
 
+// Latest camera still for a station. For the CCTV-read gauge it is the very frame the level came
+// from, so the number can be checked against the staff; for DWR stations it is DWR's own camera.
+function StationSnapshot({ station }: { readonly station: CentralStation }) {
+  const [failed, setFailed] = useState(false);
+  const [minute] = useState(() => Math.floor(Date.now() / 60_000));
+  if (!station.snapshotUrl || failed) return null;
+  const read = station.id === 'cctv-suanthep';
+  return (
+    <div className="my-3">
+      <p className="mb-1 text-xs text-muted-foreground">
+        {read
+          ? `ภาพกล้อง CCTV ที่ใช้อ่านระดับน้ำ · ${formatDateTime(station.updatedAt)}`
+          : 'ภาพจากกล้อง CCTV ล่าสุด'}
+      </p>
+      {/* eslint-disable-next-line @next/next/no-img-element -- server-provided snapshot, not an optimizable static asset */}
+      <img
+        key={`${station.id}-${station.updatedAt}`}
+        src={`${station.snapshotUrl}?t=${encodeURIComponent(station.updatedAt ?? String(minute))}`}
+        alt={`ภาพจากกล้อง CCTV ${station.name}`}
+        className="w-full rounded-md border object-cover"
+        loading="lazy"
+        onError={() => setFailed(true)}
+      />
+      <p className="mt-1 text-[11px] text-muted-foreground">
+        {read
+          ? 'ที่มา: เทศบาลเมืองปทุมธานี · ระดับน้ำคำนวณจากตำแหน่งแนวน้ำบนเสาวัด'
+          : 'ที่มา: กรมทรัพยากรน้ำ (DWR)'}
+      </p>
+    </div>
+  );
+}
+
 export function CentralDetailPanel({
   station,
   dam,
@@ -302,6 +338,7 @@ export function CentralDetailPanel({
         )}
         <Row label="หน่วยงาน" value={station.agency} />
         <Row label="อัปเดตล่าสุด" value={formatDateTime(station.updatedAt)} />
+        <StationSnapshot station={station} />
         <StationGraph station={station} />
       </Shell>
     );
