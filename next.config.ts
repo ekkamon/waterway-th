@@ -6,10 +6,11 @@ const nextConfig: NextConfig = {
   outputFileTracingExcludes: {
     "*": ["./data/**"],
   },
-  // The CCTV gauge reader spawns this bundled ffmpeg binary, which file tracing cannot see.
-  serverExternalPackages: ["ffmpeg-static"],
+  // The CCTV gauge reader decodes video with ffmpeg.wasm inside a worker thread, which file tracing
+  // cannot see (the worker is created from a string and loads these packages at run time).
+  serverExternalPackages: ["@ffmpeg/ffmpeg", "@ffmpeg/core"],
   outputFileTracingIncludes: {
-    "*": ["./node_modules/ffmpeg-static/ffmpeg*"],
+    "*": ["./node_modules/@ffmpeg/ffmpeg/**", "./node_modules/@ffmpeg/core/**"],
   },
 };
 

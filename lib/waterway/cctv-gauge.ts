@@ -1,16 +1,16 @@
-import { spawn } from "node:child_process";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { Worker } from "node:worker_threads";
 
-import ffmpegStatic from "ffmpeg-static";
 import { decode } from "jpeg-js";
 
 import { SNAPSHOT_DIR } from "./paths";
 
 // Reads the staff gauge in the Pathum Thani municipality's CCTV (Suan Thep Pathum embankment).
-// The camera serves an HLS stream of H.264 MPEG-TS segments: we fetch the newest segment, have
-// ffmpeg (ffmpeg-static, or FFMPEG_PATH) turn it into JPEG frames, and locate the waterline on
-// the yellow staff with simple colour analysis.
+// The camera serves an HLS stream of H.264 MPEG-TS segments: we fetch the newest segment, decode it
+// to JPEG frames with ffmpeg compiled to WebAssembly (@ffmpeg/ffmpeg, in a worker thread — no
+// native binary is spawned, so hosts that block executables still work), and locate the waterline
+// on the yellow staff with simple colour analysis.
 //
 // The camera is fixed, so pixel -> metres is a one-off calibration against the staff's printed
 // marks (ม.รทก.; cross-checked against ThaiWater CPY014 สะพานนวลฉวี, 8 km upstream). If the view
@@ -128,51 +128,60 @@ export function findWaterlineY(img: Rgb): number | null {
   return null;
 }
 
-// --- Frames: the segment is H.264 in MPEG-TS, so let ffmpeg decode it --------------------------
+// --- Frames: decode the H.264 segment with ffmpeg.wasm in a worker thread ------------------------
 
-function ffmpegPath(): string {
-  return process.env.FFMPEG_PATH || (ffmpegStatic as unknown as string | null) || "ffmpeg";
+const FRAMES_PER_SEGMENT_SECOND = 25;
+const DECODE_TIMEOUT_MS = 90_000;
+
+// Runs in its own thread: ffmpeg.wasm needs ~400 MB while decoding, which is released when the
+// thread ends, and it keeps the loader's fetch workaround away from the app's own fetch().
+const WORKER_SOURCE = `
+const { workerData, parentPort } = require("node:worker_threads");
+const { createRequire } = require("node:module");
+const req = createRequire(workerData.base);
+(async () => {
+  const { createFFmpeg } = req("@ffmpeg/ffmpeg");
+  // Emscripten's loader calls fetch() for the .wasm when it exists; without it, it reads the file from disk.
+  globalThis.fetch = undefined;
+  const ff = createFFmpeg({ log: false, corePath: req.resolve("@ffmpeg/core") });
+  await ff.load();
+  ff.FS("writeFile", "in.ts", workerData.segment);
+  await ff.run("-i", "in.ts", "-vf", workerData.filter, "-vsync", "vfr", "-q:v", "2", "out%03d.jpg");
+  const names = ff.FS("readdir", "/").filter((f) => f.startsWith("out") && f.endsWith(".jpg")).sort();
+  parentPort.postMessage({ frames: names.map((f) => Uint8Array.from(ff.FS("readFile", f))) });
+})().catch((e) => parentPort.postMessage({ error: String((e && e.message) || e) }));
+`;
+
+function runDecoder(segment: Uint8Array, filter: string): Promise<Uint8Array[]> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(WORKER_SOURCE, {
+      eval: true,
+      workerData: { segment, filter, base: path.join(process.cwd(), "noop.js") },
+    });
+    const timer = setTimeout(() => {
+      void worker.terminate();
+      reject(new Error("ffmpeg.wasm timed out"));
+    }, DECODE_TIMEOUT_MS);
+    const done = (fn: () => void) => {
+      clearTimeout(timer);
+      void worker.terminate();
+      fn();
+    };
+    worker.once("message", (m: { frames?: Uint8Array[]; error?: string }) =>
+      done(() => (m.frames ? resolve(m.frames) : reject(new Error(`ffmpeg.wasm: ${m.error}`)))),
+    );
+    worker.once("error", (e) => done(() => reject(e)));
+  });
 }
 
-// Every FRAME_STEP-th frame of the segment as JPEG, split out of ffmpeg's image2pipe stream.
-function decodeFrames(segment: Uint8Array): Promise<Uint8Array[]> {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(
-      ffmpegPath(),
-      [
-        "-loglevel", "error", "-i", "pipe:0",
-        "-vf", `select='not(mod(n,${FRAME_STEP}))'`, "-fps_mode", "vfr",
-        "-q:v", "2", "-f", "image2pipe", "-c:v", "mjpeg", "pipe:1",
-      ],
-      { stdio: ["pipe", "pipe", "pipe"] },
-    );
-    const out: Buffer[] = [];
-    let err = "";
-    const timer = setTimeout(() => proc.kill("SIGKILL"), 60_000);
-    proc.stdout.on("data", (c: Buffer) => out.push(c));
-    proc.stderr.on("data", (c: Buffer) => (err += c));
-    proc.on("error", (e) => {
-      clearTimeout(timer);
-      reject(e);
-    });
-    proc.stdin.on("error", () => {}); // ffmpeg may close stdin early
-    proc.on("close", (code) => {
-      clearTimeout(timer);
-      const all = Buffer.concat(out);
-      const frames: Uint8Array[] = [];
-      let start = -1;
-      for (let i = 0; i + 1 < all.length; i++) {
-        if (all[i] === 0xff && all[i + 1] === 0xd8 && start < 0) start = i;
-        else if (all[i] === 0xff && all[i + 1] === 0xd9 && start >= 0) {
-          frames.push(all.subarray(start, i + 2));
-          start = -1;
-        }
-      }
-      if (frames.length === 0) reject(new Error(`ffmpeg produced no frames (exit ${code}): ${err.slice(0, 200)}`));
-      else resolve(frames);
-    });
-    proc.stdin.end(segment);
-  });
+// A handful of frames from the END of the segment (the newest picture): the segment's frame count
+// comes from its playlist duration; if that guess finds nothing, sample the whole segment.
+async function decodeFrames(segment: Uint8Array, seconds: number): Promise<Uint8Array[]> {
+  const total = Math.round(seconds * FRAMES_PER_SEGMENT_SECOND);
+  const tail = Math.max(0, total - FRAME_STEP * FRAMES_SAMPLED * 2);
+  const frames = await runDecoder(segment, `select='gte(n,${tail})*not(mod(n,${FRAME_STEP}))'`);
+  if (frames.length >= FRAMES_SAMPLED) return frames;
+  return runDecoder(segment, `select='not(mod(n,${FRAME_STEP}))'`);
 }
 
 async function getBytes(url: string, timeoutMs: number) {
@@ -207,12 +216,15 @@ export async function readSuanThepGauge(): Promise<CctvReading> {
   if (!Number.isFinite(updatedMs) || Date.now() - updatedMs > MAX_PLAYLIST_AGE_MS) {
     throw new Error("CCTV stream is not updating");
   }
-  const segments = (await pl.text()).split(/\r?\n/).filter((l) => l && !l.startsWith("#"));
+  const playlist = (await pl.text()).split(/\r?\n/);
+  const segments = playlist.filter((l) => l && !l.startsWith("#"));
   const last = segments[segments.length - 1];
   if (!last) throw new Error("CCTV playlist is empty");
+  const extinf = playlist.filter((l) => l.startsWith("#EXTINF:"));
+  const seconds = Number.parseFloat(extinf[extinf.length - 1]?.slice(8) ?? "") || 58;
 
   const seg = new Uint8Array(await (await getBytes(`${STREAM_BASE}/${last}`, 60_000)).arrayBuffer());
-  const jpegs = await decodeFrames(seg);
+  const jpegs = await decodeFrames(seg, seconds);
   if (jpegs.length < FRAMES_SAMPLED) throw new Error(`CCTV segment has only ${jpegs.length} frames`);
 
   const lines: number[] = [];
