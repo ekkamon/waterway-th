@@ -26,7 +26,7 @@ const MAX_PLAYLIST_AGE_MS = 15 * 60 * 1000;
 // Staff centre line x(y), measured on the 640x480 frame (the staff leans a few px over its height).
 const staffCenterX = (y: number) => 298 - ((y - 70) * 9.5) / 288;
 const STRIP_HALF_WIDTH = 6;
-const STAFF_TOP_RANGE: [number, number] = [58, 78]; // where the yellow staff must start, else the camera moved
+const STAFF_TOP_RANGE: [number, number] = [62, 100]; // where the yellow staff must start, else the camera moved
 
 // y (px) of the printed 10 cm marks, measured at 640x480, and the metres they read.
 const MARKS: [number, number][] = [
@@ -77,8 +77,12 @@ export const levelAtY = (y: number) => {
 
 type Rgb = { data: Uint8Array; width: number; height: number };
 
+// Judged by chroma ratios, not absolute brightness: under overcast/rain the staff darkens to
+// ~(75,50,15) and fixed thresholds drop its lower half, which read as a too-high waterline. Staff
+// saturation (r-b)/r is > 0.55 in any light; water, wall and sky stay below ~0.25.
 function isYellow(r: number, g: number, b: number) {
-  return r > 140 && g > 100 && r - b > 80 && b < 0.62 * g;
+  const hue = g / r;
+  return r > 60 && (r - b) / r > 0.55 && hue > 0.55 && hue < 0.88;
 }
 
 /** Fraction of staff-strip pixels that are staff-yellow, per row. */
@@ -106,7 +110,7 @@ export function findWaterlineY(img: Rgb): number | null {
 
   // The staff top must sit where it was calibrated, otherwise the camera has been moved.
   let top = -1;
-  for (let y = 40; y < 140; y++) {
+  for (let y = STAFF_TOP_RANGE[0]; y < 140; y++) {
     let sum = 0;
     for (let k = 0; k < 8; k++) sum += prof[y + k];
     if (prof[y] >= 0.25 && sum >= 1.6) {
